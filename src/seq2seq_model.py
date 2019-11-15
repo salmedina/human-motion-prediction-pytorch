@@ -36,6 +36,7 @@ class Seq2SeqModel(nn.Module):
                learning_rate_decay_factor,
                loss_to_use,
                number_of_actions,
+               human_size=54,
                one_hot=True,
                residual_velocities=False,
                dropout=0.0,
@@ -64,7 +65,7 @@ class Seq2SeqModel(nn.Module):
     """
     super(Seq2SeqModel, self).__init__()
 
-    self.HUMAN_SIZE = 54
+    self.HUMAN_SIZE = human_size
     self.input_size = self.HUMAN_SIZE + number_of_actions if one_hot else self.HUMAN_SIZE
 
     print( "One hot is ", one_hot )
@@ -81,8 +82,6 @@ class Seq2SeqModel(nn.Module):
     # === Create the RNN that will keep the state ===
     print('rnn_size = {0}'.format( rnn_size ))
     self.cell = torch.nn.GRUCell(self.input_size, self.rnn_size)
-#    self.cell2 = torch.nn.GRUCell(self.rnn_size, self.rnn_size)
-
     self.fc1 = nn.Linear(self.rnn_size, self.input_size)
 
 
@@ -95,17 +94,13 @@ class Seq2SeqModel(nn.Module):
     decoder_inputs = torch.transpose(decoder_inputs, 0, 1)
 
     state = torch.zeros(batchsize, self.rnn_size)
-#    state2 = torch.zeros(batchsize, self.rnn_size)
     if use_cuda:
         state = state.cuda()
-     #   state2 = state2.cuda()
     for i in range(self.source_seq_len-1):
         state = self.cell(encoder_inputs[i], state)
-#        state2 = self.cell2(state, state2)
         state = F.dropout(state, self.dropout, training=self.training)
         if use_cuda:
             state = state.cuda()
-#            state2 = state2.cuda()
 
     outputs = []
     prev = None
@@ -114,20 +109,12 @@ class Seq2SeqModel(nn.Module):
           inp = loop_function(prev, i)
 
       inp = inp.detach()
-
       state = self.cell(inp, state)
-#      state2 = self.cell2(state, state2)
-
-#      output = inp + self.fc1(state2)
-      
-#      state = F.dropout(state, self.dropout, training=self.training)
       output = inp + self.fc1(F.dropout(state, self.dropout, training=self.training))
 
       outputs.append(output.view([1, batchsize, self.input_size]))
       if loop_function is not None:
         prev = output
-
-#    return outputs, state
 
     outputs = torch.cat(outputs, 0)
     return torch.transpose(outputs, 0, 1)
@@ -206,7 +193,7 @@ class Seq2SeqModel(nn.Module):
     idx.append( rng.randint( 16,T2-prefix-suffix ))
     return idx
 
-  def get_batch_srnn(self, data, action ):
+  def get_batch_srnn(self, data, action):
     """
     Get a random batch of data from the specified bucket, prepare for step.
 
