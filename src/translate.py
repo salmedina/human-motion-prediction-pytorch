@@ -83,7 +83,7 @@ parser.add_argument('--action', dest='action',
 parser.add_argument('--use_cpu', dest='use_cpu',
                   help='', action='store_true',
                   default=False)
-parser.add_argument('--load', dest='load',
+parser.add_argument('--load_id', dest='load_id',
                   help='Try to load a previous checkpoint.',
                   default=0, type=int)
 parser.add_argument('--sample', dest='sample',
@@ -125,11 +125,11 @@ def create_model(actions, sampling=False):
       args.residual_velocities,
       dtype=torch.float32)
 
-  if args.load <= 0:
+  if args.load_id <= 0:
     return model
 
   print("Loading model")
-  model = torch.load(train_dir + '/model_' + str(args.load))
+  model = torch.load(train_dir + '/model_' + str(args.load_id))
   if sampling:
     model.source_seq_len = 50
     model.target_seq_len = 100
@@ -160,7 +160,7 @@ def train():
 
     #=== This is the training loop ===
     step_time, loss, val_loss = 0.0, 0.0, 0.0
-    current_step = 0 if args.load <= 0 else args.load + 1
+    current_step = 0 if args.load_id <= 0 else args.load_id + 1
     previous_losses = []
 
     step_time, loss = 0, 0
