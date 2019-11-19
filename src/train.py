@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.autograd import Variable
 import argparse
 
-# Learning
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train RNN for human pose estimation')
     parser.add_argument('--learning_rate', dest='learning_rate',
@@ -105,6 +105,7 @@ def make_train_dir(args):
 
     print(train_dir)
     os.makedirs(train_dir, exist_ok=True)
+    return train_dir
 
 
 def define_actions( action ):
@@ -136,7 +137,7 @@ def define_actions( action ):
   raise( ValueError, "Unrecognized action: %d" % action )
 
 
-def create_model(actions, sampling=False):
+def create_model(args, actions, sampling=False):
   """Create translation model and initialize or load parameters in session."""
 
   model = seq2seq_model.Seq2SeqModel(
@@ -166,47 +167,84 @@ def create_model(actions, sampling=False):
   return model
 
 
-def train(args):
+def train(args, train_dir):
   """Train a seq2seq model on human motion"""
 
-  actions = define_actions( args.action )
-
-  number_of_actions = len( actions )
+  actions = define_actions(args.action)
 
   train_set, test_set, data_mean, data_std, dim_to_ignore, dim_to_use = read_all_data(
     actions, args.seq_length_in, args.seq_length_out, args.data_dir, not args.omit_one_hot )
 
-  # Limit TF to take a fraction of the GPU memory
+  model = create_model(args, actions, args.sample)
+  if not args.use_cpu:
+      model = model.cuda()
 
-  if True:
-    model = create_model(actions, args.sample)
+  # === Read and denormalize the gt with srnn's seeds, as we'll need them
+  # many times for evaluation in Euler Angles ===
+  srnn_gts_euler = get_srnn_gts( actions, model, test_set, data_mean,
+                            data_std, dim_to_ignore, not args.omit_one_hot )
+
+  #=== This is the training loop ===
+  step_time, loss, val_loss = 0.0, 0.0, 0.0
+  current_step = 0 if args.load_id <= 0 else args.load_id + 1
+  previous_losses = []
+
+  step_time, loss = 0, 0
+  optimiser = optim.SGD(model.parameters(), lr=args.learning_rate)
+  #optimiser = optim.Adam(model.parameters(), lr=learning_rate, betas = (0.9, 0.999))
+
+  for _ in range( args.iterations ):
+    optimiser.zero_grad()
+    model.train()
+
+    start_time = time.time()
+
+    # Actual training
+
+    # === Training step ===
+    encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( train_set, not args.omit_one_hot )
+    encoder_inputs = torch.from_numpy(encoder_inputs).float()
+    decoder_inputs = torch.from_numpy(decoder_inputs).float()
+    decoder_outputs = torch.from_numpy(decoder_outputs).float()
     if not args.use_cpu:
-        model = model.cuda()
+      encoder_inputs = encoder_inputs.cuda()
+      decoder_inputs = decoder_inputs.cuda()
+      decoder_outputs = decoder_outputs.cuda()
+    encoder_inputs = Variable(encoder_inputs)
+    decoder_inputs = Variable(decoder_inputs)
+    decoder_outputs = Variable(decoder_outputs)
 
-    # === Read and denormalize the gt with srnn's seeds, as we'll need them
-    # many times for evaluation in Euler Angles ===
-    srnn_gts_euler = get_srnn_gts( actions, model, test_set, data_mean,
-                              data_std, dim_to_ignore, not args.omit_one_hot )
+    preds = model(encoder_inputs, decoder_inputs)
 
-    #=== This is the training loop ===
-    step_time, loss, val_loss = 0.0, 0.0, 0.0
-    current_step = 0 if args.load_id <= 0 else args.load_id + 1
-    previous_losses = []
+    step_loss = (preds-decoder_outputs)**2
+    step_loss = step_loss.mean()
 
-    step_time, loss = 0, 0
-    optimiser = optim.SGD(model.parameters(), lr=args.learning_rate)
-    #optimiser = optim.Adam(model.parameters(), lr=learning_rate, betas = (0.9, 0.999))
+    # Actual backpropagation
+    step_loss.backward()
+    optimiser.step()
 
-    for _ in range( args.iterations ):
-      optimiser.zero_grad()
-      model.train()
+    step_loss = step_loss.cpu().data.numpy()
 
-      start_time = time.time()
+    if current_step % 10 == 0:
+      print("step {0:04d}; step_loss: {1:.4f}".format(current_step, step_loss ))
 
-      # Actual training
+    step_time += (time.time() - start_time) / args.test_every
+    loss += step_loss / args.test_every
+    current_step += 1
+    # === step decay ===
+    if current_step % args.learning_rate_step == 0:
+      args.learning_rate = args.learning_rate*args.learning_rate_decay_factor
+      optimiser = optim.Adam(model.parameters(), lr=args.learning_rate, betas = (0.9, 0.999))
+      print("Decay learning rate. New value at " + str(args.learning_rate))
 
-      # === Training step ===
-      encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( train_set, not args.omit_one_hot )
+    #cuda.empty_cache()
+
+    # Once in a while, we save checkpoint, print statistics, and run evals.
+    if current_step % args.test_every == 0:
+      model.eval()
+
+      # === Validation with randomly chosen seeds ===
+      encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( test_set, not args.omit_one_hot )
       encoder_inputs = torch.from_numpy(encoder_inputs).float()
       decoder_inputs = torch.from_numpy(decoder_inputs).float()
       decoder_outputs = torch.from_numpy(decoder_outputs).float()
@@ -222,33 +260,22 @@ def train(args):
 
       step_loss = (preds-decoder_outputs)**2
       step_loss = step_loss.mean()
-    
-      # Actual backpropagation
-      step_loss.backward()
-      optimiser.step()
 
-      step_loss = step_loss.cpu().data.numpy()
+      val_loss = step_loss # Loss book-keeping
 
-      if current_step % 10 == 0:
-        print("step {0:04d}; step_loss: {1:.4f}".format(current_step, step_loss ))
+      print()
+      print("{0: <16} |".format("milliseconds"), end="")
+      for ms in [80, 160, 320, 400, 560, 1000]:
+        print(" {0:5d} |".format(ms), end="")
+      print()
 
-      step_time += (time.time() - start_time) / args.test_every
-      loss += step_loss / args.test_every
-      current_step += 1
-      # === step decay ===
-      if current_step % args.learning_rate_step == 0:
-        args.learning_rate = args.learning_rate*args.learning_rate_decay_factor
-        optimiser = optim.Adam(model.parameters(), lr=args.learning_rate, betas = (0.9, 0.999))
-        print("Decay learning rate. New value at " + str(args.learning_rate))
+      # === Validation with srnn's seeds ===
+      for action in actions:
 
-      #cuda.empty_cache()
+        # Evaluate the model on the test batches
+        encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch_srnn( test_set, action )
+        #### Evaluate model on action
 
-      # Once in a while, we save checkpoint, print statistics, and run evals.
-      if current_step % args.test_every == 0:
-        model.eval()
-
-        # === Validation with randomly chosen seeds ===
-        encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( test_set, not args.omit_one_hot )
         encoder_inputs = torch.from_numpy(encoder_inputs).float()
         decoder_inputs = torch.from_numpy(decoder_inputs).float()
         decoder_outputs = torch.from_numpy(decoder_outputs).float()
@@ -259,120 +286,89 @@ def train(args):
         encoder_inputs = Variable(encoder_inputs)
         decoder_inputs = Variable(decoder_inputs)
         decoder_outputs = Variable(decoder_outputs)
-  
-        preds = model(encoder_inputs, decoder_inputs)
-  
-        step_loss = (preds-decoder_outputs)**2
-        step_loss = step_loss.mean()
 
-        val_loss = step_loss # Loss book-keeping
+        srnn_poses = model(encoder_inputs, decoder_inputs)
 
+
+        srnn_loss = (srnn_poses - decoder_outputs)**2
+        srnn_loss.cpu().data.numpy()
+        srnn_loss = srnn_loss.mean()
+
+        srnn_poses = srnn_poses.cpu().data.numpy()
+        srnn_poses = srnn_poses.transpose([1,0,2])
+
+        srnn_loss = srnn_loss.cpu().data.numpy()
+        # Denormalize the output
+        srnn_pred_expmap = data_utils.revert_output_format( srnn_poses,
+          data_mean, data_std, dim_to_ignore, actions, not args.omit_one_hot )
+
+        # Save the errors here
+        mean_errors = np.zeros( (len(srnn_pred_expmap), srnn_pred_expmap[0].shape[0]) )
+
+        # Training is done in exponential map, but the error is reported in
+        # Euler angles, as in previous work.
+        # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-247769197
+        N_SEQUENCE_TEST = 8
+        for i in np.arange(N_SEQUENCE_TEST):
+          eulerchannels_pred = srnn_pred_expmap[i]
+
+          # Convert from exponential map to Euler angles
+          for j in np.arange( eulerchannels_pred.shape[0] ):
+            for k in np.arange(3,97,3):
+              eulerchannels_pred[j,k:k+3] = data_utils.rotmat2euler(
+                data_utils.expmap2rotmat( eulerchannels_pred[j,k:k+3] ))
+
+          # The global translation (first 3 entries) and global rotation
+          # (next 3 entries) are also not considered in the error, so the_key
+          # are set to zero.
+          # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-249404882
+          gt_i=np.copy(srnn_gts_euler[action][i])
+          gt_i[:,0:6] = 0
+
+          # Now compute the l2 error. The following is numpy port of the error
+          # function provided by Ashesh Jain (in matlab), available at
+          # https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/dataParser/Utils/motionGenerationError.m#L40-L54
+          idx_to_use = np.where( np.std( gt_i, 0 ) > 1e-4 )[0]
+
+          euc_error = np.power( gt_i[:,idx_to_use] - eulerchannels_pred[:,idx_to_use], 2)
+          euc_error = np.sum(euc_error, 1)
+          euc_error = np.sqrt( euc_error )
+          mean_errors[i,:] = euc_error
+
+        # This is simply the mean error over the N_SEQUENCE_TEST examples
+        mean_mean_errors = np.mean( mean_errors, 0 )
+
+        # Pretty print of the results for 80, 160, 320, 400, 560 and 1000 ms
+        print("{0: <16} |".format(action), end="")
+        for ms in [1,3,7,9,13,24]:
+          if args.seq_length_out >= ms+1:
+            print(" {0:.3f} |".format( mean_mean_errors[ms] ), end="")
+          else:
+            print("   n/a |", end="")
         print()
-        print("{0: <16} |".format("milliseconds"), end="")
-        for ms in [80, 160, 320, 400, 560, 1000]:
-          print(" {0:5d} |".format(ms), end="")
-        print()
 
-        # === Validation with srnn's seeds ===
-        for action in actions:
+      print()
+      print("============================\n"
+            "Global step:         %d\n"
+            "Learning rate:       %.4f\n"
+            "Step-time (ms):     %.4f\n"
+            "Train loss avg:      %.4f\n"
+            "--------------------------\n"
+            "Val loss:            %.4f\n"
+            "srnn loss:           %.4f\n"
+            "============================" % (current_step,
+            args.learning_rate, step_time*1000, loss,
+            val_loss, srnn_loss))
 
-          # Evaluate the model on the test batches
-          encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch_srnn( test_set, action )
-          #### Evaluate model on action
-  
-          encoder_inputs = torch.from_numpy(encoder_inputs).float()
-          decoder_inputs = torch.from_numpy(decoder_inputs).float()
-          decoder_outputs = torch.from_numpy(decoder_outputs).float()
-          if not args.use_cpu:
-            encoder_inputs = encoder_inputs.cuda()
-            decoder_inputs = decoder_inputs.cuda()
-            decoder_outputs = decoder_outputs.cuda()
-          encoder_inputs = Variable(encoder_inputs)
-          decoder_inputs = Variable(decoder_inputs)
-          decoder_outputs = Variable(decoder_outputs)
-    
-          srnn_poses = model(encoder_inputs, decoder_inputs)
+      torch.save(model, train_dir + '/model_' + str(current_step))
 
+      print()
+      previous_losses.append(loss)
 
-          srnn_loss = (srnn_poses - decoder_outputs)**2
-          srnn_loss.cpu().data.numpy()
-          srnn_loss = srnn_loss.mean()
+      # Reset global time and loss
+      step_time, loss = 0, 0
 
-          srnn_poses = srnn_poses.cpu().data.numpy()
-          srnn_poses = srnn_poses.transpose([1,0,2])
-
-          srnn_loss = srnn_loss.cpu().data.numpy()
-          # Denormalize the output
-          srnn_pred_expmap = data_utils.revert_output_format( srnn_poses,
-            data_mean, data_std, dim_to_ignore, actions, not args.omit_one_hot )
-
-          # Save the errors here
-          mean_errors = np.zeros( (len(srnn_pred_expmap), srnn_pred_expmap[0].shape[0]) )
-
-          # Training is done in exponential map, but the error is reported in
-          # Euler angles, as in previous work.
-          # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-247769197
-          N_SEQUENCE_TEST = 8
-          for i in np.arange(N_SEQUENCE_TEST):
-            eulerchannels_pred = srnn_pred_expmap[i]
-
-            # Convert from exponential map to Euler angles
-            for j in np.arange( eulerchannels_pred.shape[0] ):
-              for k in np.arange(3,97,3):
-                eulerchannels_pred[j,k:k+3] = data_utils.rotmat2euler(
-                  data_utils.expmap2rotmat( eulerchannels_pred[j,k:k+3] ))
-
-            # The global translation (first 3 entries) and global rotation
-            # (next 3 entries) are also not considered in the error, so the_key
-            # are set to zero.
-            # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-249404882
-            gt_i=np.copy(srnn_gts_euler[action][i])
-            gt_i[:,0:6] = 0
-
-            # Now compute the l2 error. The following is numpy port of the error
-            # function provided by Ashesh Jain (in matlab), available at
-            # https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/dataParser/Utils/motionGenerationError.m#L40-L54
-            idx_to_use = np.where( np.std( gt_i, 0 ) > 1e-4 )[0]
-            
-            euc_error = np.power( gt_i[:,idx_to_use] - eulerchannels_pred[:,idx_to_use], 2)
-            euc_error = np.sum(euc_error, 1)
-            euc_error = np.sqrt( euc_error )
-            mean_errors[i,:] = euc_error
-
-          # This is simply the mean error over the N_SEQUENCE_TEST examples
-          mean_mean_errors = np.mean( mean_errors, 0 )
-
-          # Pretty print of the results for 80, 160, 320, 400, 560 and 1000 ms
-          print("{0: <16} |".format(action), end="")
-          for ms in [1,3,7,9,13,24]:
-            if args.seq_length_out >= ms+1:
-              print(" {0:.3f} |".format( mean_mean_errors[ms] ), end="")
-            else:
-              print("   n/a |", end="")
-          print()
-
-        print()
-        print("============================\n"
-              "Global step:         %d\n"
-              "Learning rate:       %.4f\n"
-              "Step-time (ms):     %.4f\n"
-              "Train loss avg:      %.4f\n"
-              "--------------------------\n"
-              "Val loss:            %.4f\n"
-              "srnn loss:           %.4f\n"
-              "============================" % (current_step,
-              args.learning_rate, step_time*1000, loss,
-              val_loss, srnn_loss))
-
-        torch.save(model, train_dir + '/model_' + str(current_step))
-
-        print()
-        previous_losses.append(loss)
-
-        # Reset global time and loss
-        step_time, loss = 0, 0
-
-        sys.stdout.flush()
+      sys.stdout.flush()
 
 
 def get_srnn_gts( actions, model, test_set, data_mean, data_std, dim_to_ignore, one_hot, to_euler=True ):
@@ -426,7 +422,7 @@ def sample(args):
     # === Create the model ===
     print("Creating %d layers of %d units." % (args.num_layers, args.size))
     sampling     = True
-    model = create_model(actions, sampling)
+    model = create_model(args, actions, sampling)
     if not args.use_cpu:
         model = model.cuda()
     print("Model created")
@@ -563,13 +559,13 @@ def read_all_data( actions, seq_length_in, seq_length_out, data_dir, one_hot ):
 
 
 def main():
-  args = parse_args()
-  make_train_dir(args)
+  sys_args = parse_args()
+  train_dir = make_train_dir(sys_args)
 
-  if args.sample:
-    sample(args)
+  if sys_args.sample:
+    sample(sys_args)
   else:
-    train(args)
+    train(sys_args, train_dir=train_dir)
 
 
 if __name__ == "__main__":
